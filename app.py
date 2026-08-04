@@ -3,65 +3,49 @@ import json
 import re
 import sys
 import traceback
+
+# Set non-interactive Matplotlib backend for Streamlit server rendering
+import matplotlib
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
-
-# Force non-interactive Matplotlib backend for headless Streamlit server rendering
-import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# Streamlit Page Setup
 st.set_page_config(
-    page_title="Multi-CSV Code-as-Action Agent",
+    page_title="CSV Data Analyst Chatbot",
+    page_icon="💬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-st.title("📂 Multi-CSV Code-as-Action Agent")
 
-# Sidebar Configuration
-with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input("OpenAI API Key", type="password")
-    model_choice = st.selectbox("LLM Model", ["gpt-4o", "gpt-4o-mini"], index=0)
-    st.markdown("---")
-    st.caption(
-        "Supported Pattern: Multi-table joins, Pandas merges, Matplotlib/Seaborn charts."
-    )
-
-# File uploader allowing multiple CSV files simultaneously
-uploaded_files = st.file_uploader(
-    "Upload one or more CSV files", type=["csv"], accept_multiple_files=True
-)
+st.title("💬 Multi-CSV AI Data Analyst")
 
 
+# -------------------------------------------------------------------
+# Helper Functions
+# -------------------------------------------------------------------
 def sanitize_table_name(filename: str) -> str:
-    """Sanitizes filename into a clean Python dictionary key.
-
-    e.g., 'customer-orders 2026.csv' -> 'customer_orders_2026'
-    """
+    """Sanitize filename into a clean Python dictionary key."""
     clean_name = filename.rsplit(".", 1)[0]
     clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", clean_name)
-    clean_name = re.sub(r"_+" , "_", clean_name).strip("_")
+    clean_name = re.sub(r"_+", "_", clean_name).strip("_")
     return clean_name.lower()
 
 
 def execute_python_code_and_capture_charts(code: str, dfs: dict):
-    """Executes code against the `dfs` dictionary, capturing stdout text
+    """Execute code locally against `dfs`, capture stdout text,
 
-    and intercepting Matplotlib/Seaborn figures from memory.
+    and intercept Matplotlib/Seaborn figures as raw bytes.
     """
     buffer = io.StringIO()
     sys.stdout = buffer
 
-    # Clear any leftover figures in matplotlib session
     plt.close("all")
-
-    # Expose data science libraries and the multi-CSV dictionary
     local_scope = {"dfs": dfs, "pd": pd, "plt": plt, "sns": sns}
-
     captured_figures = []
 
     try:
@@ -74,9 +58,7 @@ def execute_python_code_and_capture_charts(code: str, dfs: dict):
                 fig = plt.figure(fig_num)
                 img_buf = io.BytesIO()
                 fig.savefig(img_buf, format="png", bbox_inches="tight", dpi=150)
-                img_buf.seek(0)
-                captured_figures.append(img_buf)
-
+                captured_figures.append(img_buf.getvalue())  # Store raw bytes
             plt.close("all")
 
         if not output_text and not captured_figures:
@@ -92,27 +74,24 @@ def execute_python_code_and_capture_charts(code: str, dfs: dict):
     return output_text, captured_figures
 
 
-# OpenAI Function / Tool Definition
+# Tool definition for OpenAI Tool Calling
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "execute_python_code",
             "description": (
-                "Execute Python code against the dictionary of DataFrames 'dfs'. "
-                "Access tables via `dfs['table_name']`. Available libraries: `dfs`, `pd`, `plt`, `sns`. "
-                "You can perform pd.merge() across datasets and plot charts. Do NOT call plt.show(). "
-                "Always print key figures or results."
+                "Execute Python code against the dictionary of DataFrames `dfs`. "
+                "Access datasets via `dfs['table_name']`. Available packages: `dfs`, `pd`, `plt`, `sns`. "
+                "Use pd.merge() for multi-table queries. Do NOT call plt.show(). "
+                "Always print key statistics and summary findings."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": (
-                            "Executable Python snippet. "
-                            "Example: `merged = pd.merge(dfs['orders'], dfs['customers'], on='cust_id'); print(merged.groupby('city')['amount'].sum())`"
-                        ),
+                        "description": "Executable Python code snippet.",
                     }
                 },
                 "required": ["code"],
@@ -121,18 +100,38 @@ TOOLS = [
     }
 ]
 
+# -------------------------------------------------------------------
+# Sidebar: Configuration & Data Management
+# -------------------------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    api_key = st.text_input("OpenAI API Key", type="password")
+    model_choice = st.selectbox("LLM Model", ["gpt-4o", "gpt-4o-mini"], index=0)
 
-if uploaded_files and api_key:
-    client = OpenAI(api_key=api_key)
+    st.markdown("---")
+    st.header("📂 Data Upload")
+    uploaded_files = st.file_uploader(
+        "Upload CSV files", type=["csv"], accept_multiple_files=True
+    )
 
-    # 1. Load all CSVs into the `dfs` dictionary and build schema context
-    dfs = {}
-    schema_summaries = []
+    if st.button("Clear Chat History"):
+        st.session_state.messages = []
+        st.rerun()
 
+# -------------------------------------------------------------------
+# Session State Initialization & Data Pre-Processing
+# -------------------------------------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+dfs = {}
+schema_summaries = []
+
+if uploaded_files:
     for file in uploaded_files:
         table_name = sanitize_table_name(file.name)
-        
-        # Ensure unique table names if duplicate files are uploaded
+
+        # Handle duplicate file names gracefully
         counter = 1
         original_name = table_name
         while table_name in dfs:
@@ -142,12 +141,9 @@ if uploaded_files and api_key:
         df_temp = pd.read_csv(file)
         dfs[table_name] = df_temp
 
-        # Structure schema metadata for the LLM
         cols_summary = dict(df_temp.dtypes)
         sample_row = (
-            df_temp.head(1).to_dict(orient="records")[0]
-            if not df_temp.empty
-            else {}
+            df_temp.head(1).to_dict(orient="records")[0] if not df_temp.empty else {}
         )
 
         schema_summaries.append(
@@ -157,35 +153,63 @@ if uploaded_files and api_key:
             f"- Sample Row: {sample_row}\n"
         )
 
-    # 2. UI Layout
-    col1, col2 = st.columns([1, 1])
-
-    with col1:
-        st.subheader(f"📊 Loaded Datasets ({len(dfs)})")
-        selected_table = st.selectbox("Select dataset to preview:", list(dfs.keys()))
+    # Show dataset inspector in the sidebar
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader(f"📊 Datasets Preview ({len(dfs)})")
+        selected_table = st.selectbox(
+            "Inspect Dataset:", list(dfs.keys()), key="preview_select"
+        )
         if selected_table:
-            st.dataframe(dfs[selected_table].head(10), use_container_width=True)
+            st.dataframe(dfs[selected_table].head(5), use_container_width=True)
             st.caption(f"Shape: {dfs[selected_table].shape}")
 
-        with st.expander("View Full Multi-Table Metadata"):
-            for summary in schema_summaries:
-                st.markdown(summary)
+# -------------------------------------------------------------------
+# Chat History Rendering
+# -------------------------------------------------------------------
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        # If assistant message has execution trace steps, render them in expandable status blocks
+        if "steps" in msg and msg["steps"]:
+            for step_idx, step in enumerate(msg["steps"]):
+                with st.expander(f"🛠️ Execution Step {step_idx + 1}", expanded=False):
+                    st.code(step["code"], language="python")
+                    if step["output"]:
+                        st.text(f"Console Output:\n{step['output']}")
+                    if step["charts"]:
+                        for chart_bytes in step["charts"]:
+                            st.image(chart_bytes, use_container_width=True)
 
-    with col2:
-        st.subheader("💬 Ask Questions Across Your Datasets")
-        user_query = st.text_input(
-            "What would you like to analyze or visualize?",
-            placeholder="e.g., Join orders and customers to plot revenue by customer country",
-        )
+        # Render final markdown text message
+        if msg["content"]:
+            st.markdown(msg["content"])
 
-        if user_query:
-            st.markdown("---")
-            st.subheader("⚙️ Agent Execution Trace")
+# -------------------------------------------------------------------
+# User Input & Agent Loop
+# -------------------------------------------------------------------
+user_input = st.chat_input(
+    "Ask a question or request a visualization across your datasets..."
+)
 
-            # System prompt describing the complete multi-table schema
-            all_schemas_prompt = "\n---\n".join(schema_summaries)
-            system_prompt = f"""
-You are an expert Data Science Agent skilled at multi-table analysis using Pandas and Matplotlib/Seaborn.
+if user_input:
+    # Validation checks
+    if not api_key:
+        st.error("Please enter your OpenAI API key in the sidebar.")
+        st.stop()
+    if not uploaded_files:
+        st.error("Please upload at least one CSV file in the sidebar.")
+        st.stop()
+
+    client = OpenAI(api_key=api_key)
+
+    # 1. Display User Message
+    st.chat_message("user").markdown(user_input)
+    st.session_state.messages.append({"role": "user", "content": user_input})
+
+    # 2. Build System Prompt with current multi-table schema
+    all_schemas_prompt = "\n---\n".join(schema_summaries)
+    system_prompt = f"""
+You are an expert AI Data Analyst conversing with a user in a chatbot interface.
 You have direct access to a dictionary of DataFrames named `dfs`.
 
 AVAILABLE DATASETS:
@@ -193,85 +217,114 @@ AVAILABLE DATASETS:
 
 INSTRUCTIONS:
 1. Access datasets via `dfs['table_name']`.
-2. When answering queries requiring data from multiple files, use `pd.merge()`, `pd.concat()`, or cross-table lookup logic.
-3. For charts, construct them using `plt`, `sns`, or `dataframe.plot()`. Do NOT call `plt.show()`.
-4. ALWAYS use `print()` to output key calculations, aggregates, or final summary numbers.
+2. When answering multi-table questions, use `pd.merge()`, `pd.concat()`, or cross-table filter logic.
+3. Construct charts using `plt`, `sns`, or `df.plot()`. Do NOT call `plt.show()`.
+4. Always print key numerical figures and summarize your findings cleanly in your final message response.
 """
 
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query},
-            ]
+    # Build conversation context for API call from session state
+    llm_messages = [{"role": "system", "content": system_prompt}]
+    for m in st.session_state.messages:
+        llm_messages.append({"role": m["role"], "content": m["content"]})
 
-            max_steps = 4
-            for step in range(max_steps):
-                with st.spinner(f"Agent reasoning & coding (Step {step + 1})..."):
-                    response = client.chat.completions.create(
-                        model=model_choice,
-                        messages=messages,
-                        tools=TOOLS,
-                        tool_choice="auto",
-                    )
+    # 3. Stream Assistant Chat Turn
+    with st.chat_message("assistant"):
+        assistant_steps = []
+        final_response_text = ""
 
-                msg = response.choices[0].message
-                messages.append(msg)
+        max_steps = 4
+        for step in range(max_steps):
+            with st.spinner(f"Analyzing & Coding (Step {step + 1})..."):
+                response = client.chat.completions.create(
+                    model=model_choice,
+                    messages=llm_messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                )
 
-                # Check if the agent called the code execution tool
-                if msg.tool_calls:
-                    for tool_call in msg.tool_calls:
-                        if tool_call.function.name == "execute_python_code":
-                            args = json.loads(tool_call.function.arguments)
-                            code_snippet = args.get("code", "")
+            response_msg = response.choices[0].message
+            llm_messages.append(response_msg)
 
-                            with st.status(
-                                f"Step {step + 1}: Generated Python Action",
-                                expanded=True,
-                            ) as status:
-                                st.code(code_snippet, language="python")
+            # Handle Code Action Tool Calls
+            if response_msg.tool_calls:
+                for tool_call in response_msg.tool_calls:
+                    if tool_call.function.name == "execute_python_code":
+                        args = json.loads(tool_call.function.arguments)
+                        code_snippet = args.get("code", "")
 
-                                # Execute code against the dictionary of dataframes
-                                (
-                                    text_output,
-                                    figures,
-                                ) = execute_python_code_and_capture_charts(
+                        # Render live step execution inside expandable status block
+                        with st.status(
+                            f"Step {step + 1}: Executing Code Action",
+                            expanded=True,
+                        ) as status:
+                            st.code(code_snippet, language="python")
+
+                            text_output, charts = (
+                                execute_python_code_and_capture_charts(
                                     code_snippet, dfs
                                 )
-
-                                # Render printed output
-                                if text_output:
-                                    st.write("**Console Output:**")
-                                    st.text(text_output)
-
-                                # Render captured charts
-                                if figures:
-                                    st.write("**Generated Visualizations:**")
-                                    for idx, fig_buf in enumerate(figures):
-                                        st.image(
-                                            fig_buf,
-                                            caption=f"Generated Chart {idx + 1}",
-                                            use_container_width=True,
-                                        )
-
-                                status.update(
-                                    label=f"Step {step + 1}: Execution Complete",
-                                    state="complete",
-                                )
-
-                            # Feed execution output back into the agent's context
-                            tool_feedback = f"Console Output: {text_output}\nGenerated {len(figures)} chart(s) successfully."
-                            messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": tool_feedback,
-                                }
                             )
-                else:
-                    # Final synthesis response from the LLM
-                    st.success("Analysis Complete!")
-                    st.markdown("### 🎯 Executive Summary")
-                    st.write(msg.content)
-                    break
 
-elif uploaded_files and not api_key:
-    st.info("Please enter your OpenAI API key in the sidebar to proceed.")
+                            if text_output:
+                                st.write("**Console Output:**")
+                                st.text(text_output)
+
+                            if charts:
+                                st.write("**Generated Charts:**")
+                                for chart_bytes in charts:
+                                    st.image(
+                                        chart_bytes,
+                                        use_container_width=True,
+                                    )
+
+                            status.update(
+                                label=f"Step {step + 1}: Complete",
+                                state="complete",
+                            )
+
+                        # Save step data to persist in chat history
+                        assistant_steps.append(
+                            {
+                                "code": code_snippet,
+                                "output": text_output,
+                                "charts": charts,
+                            }
+                        )
+
+                        # Feed output back into conversation history
+                        tool_feedback = f"Console Output: {text_output}\nGenerated {len(charts)} chart(s)."
+                        llm_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": tool_feedback,
+                            }
+                        )
+            else:
+                # Final text response from Assistant
+                final_response_text = response_msg.content or ""
+                if final_response_text:
+                    st.markdown(final_response_text)
+                break
+
+        # If no final response was generated, request one
+        if not final_response_text and assistant_steps:
+            with st.spinner("Generating final summary..."):
+                response = client.chat.completions.create(
+                    model=model_choice,
+                    messages=llm_messages,
+                    tools=TOOLS,
+                    tool_choice="none",
+                )
+                final_response_text = response.choices[0].message.content or ""
+                if final_response_text:
+                    st.markdown(final_response_text)
+
+        # Save assistant turn to session state
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": final_response_text,
+                "steps": assistant_steps,
+            }
+        )
