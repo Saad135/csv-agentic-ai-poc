@@ -128,9 +128,32 @@ TOOLS = [
 # -------------------------------------------------------------------
 # Sidebar: Configuration & Data Management
 # -------------------------------------------------------------------
+# Safely inspect Streamlit Secrets for OPENAI_API_KEY
+secret_key = ""
+try:
+    if "OPENAI_API_KEY" in st.secrets:
+        secret_key = st.secrets["OPENAI_API_KEY"]
+except Exception:
+    secret_key = ""
+
 with st.sidebar:
     st.header("⚙️ Configuration")
-    api_key = st.text_input("OpenAI API Key", type="password")
+
+    if secret_key:
+        st.success("API Key loaded from secrets", icon="🔒")
+        override_key = st.text_input(
+            "Override API Key (Optional)",
+            type="password",
+            help="Leave blank to use key from Streamlit secrets.",
+        )
+        api_key = override_key.strip() if override_key.strip() else secret_key
+    else:
+        api_key = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            help="Enter your API key or set OPENAI_API_KEY in .streamlit/secrets.toml",
+        )
+
     model_choice = st.selectbox("LLM Model", ["gpt-4o", "gpt-4o-mini"], index=0)
 
     st.markdown("---")
