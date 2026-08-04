@@ -266,6 +266,8 @@ INSTRUCTIONS:
 2. When answering queries, generate Python code to compute metrics or generate plots.
 3. ALWAYS print key output, dataframes, or numbers explicitly.
 4. Synthesize and clearly present the calculated results in your final text response.
+5. If the user request is ambiguous, ask for clarification instead of making assumptions.
+6. If the answer is not in the datasets, work with the user to come up with an action plan or next steps.
 """
 
     llm_messages = [{"role": "system", "content": system_prompt}]
