@@ -302,23 +302,9 @@ INSTRUCTIONS:
                         )
             else:
                 # Final text response from Assistant
-                final_response_text = response_msg.content or ""
-                if final_response_text:
-                    st.markdown(final_response_text)
+                final_response_text = response_msg.content
+                st.markdown(final_response_text)
                 break
-
-        # If no final response was generated, request one
-        if not final_response_text and assistant_steps:
-            with st.spinner("Generating final summary..."):
-                response = client.chat.completions.create(
-                    model=model_choice,
-                    messages=llm_messages,
-                    tools=TOOLS,
-                    tool_choice="none",
-                )
-                final_response_text = response.choices[0].message.content or ""
-                if final_response_text:
-                    st.markdown(final_response_text)
 
         # Save assistant turn to session state
         st.session_state.messages.append(
