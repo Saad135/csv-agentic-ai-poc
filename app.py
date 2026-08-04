@@ -1,15 +1,16 @@
+import ast
 import io
 import json
 import re
 import sys
 import traceback
 
-# Set non-interactive Matplotlib backend for Streamlit server rendering
 import matplotlib
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
+# Set non-interactive Matplotlib backend for Streamlit server rendering
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -37,9 +38,9 @@ def sanitize_table_name(filename: str) -> str:
 
 
 def execute_python_code_and_capture_charts(code: str, dfs: dict):
-    """Execute code locally against `dfs`, capture stdout text,
+    """Execute code locally against `dfs`, capture stdout text (with AST auto-print),
 
-    and intercept Matplotlib/Seaborn figures as raw bytes.
+    and intercept Matplotlib/Seaborn figures.
     """
     buffer = io.StringIO()
     sys.stdout = buffer
@@ -49,7 +50,33 @@ def execute_python_code_and_capture_charts(code: str, dfs: dict):
     captured_figures = []
 
     try:
-        exec(code, local_scope)
+        # Try AST modification to automatically wrap the last expression in print()
+        # (e.g., converts `df.head()` to `print(df.head())`)
+        try:
+            tree = ast.parse(code)
+            if tree.body and isinstance(tree.body[-1], ast.Expr):
+                last_val = tree.body[-1].value
+                # Avoid wrapping if it's already a print statement
+                is_print = (
+                    isinstance(last_val, ast.Call)
+                    and isinstance(last_val.func, ast.Name)
+                    and last_val.func.id == "print"
+                )
+                if not is_print:
+                    tree.body[-1] = ast.Expr(
+                        value=ast.Call(
+                            func=ast.Name(id="print", ctx=ast.Load()),
+                            args=[last_val],
+                            keywords=[],
+                        )
+                    )
+                    ast.fix_missing_locations(tree)
+            compiled_code = compile(tree, filename="<ast>", mode="exec")
+            exec(compiled_code, local_scope)
+        except Exception:
+            # Fallback to direct execution if AST parsing fails
+            exec(code, local_scope)
+
         output_text = buffer.getvalue().strip()
 
         # Intercept any active figures generated during execution
@@ -58,13 +85,11 @@ def execute_python_code_and_capture_charts(code: str, dfs: dict):
                 fig = plt.figure(fig_num)
                 img_buf = io.BytesIO()
                 fig.savefig(img_buf, format="png", bbox_inches="tight", dpi=150)
-                captured_figures.append(img_buf.getvalue())  # Store raw bytes
+                captured_figures.append(img_buf.getvalue())
             plt.close("all")
 
         if not output_text and not captured_figures:
-            output_text = (
-                "Code executed successfully with no print output or figures generated."
-            )
+            output_text = "Code executed successfully with no returned output or figures generated."
 
     except Exception:
         output_text = f"Execution Error:\n{traceback.format_exc()}"
@@ -84,7 +109,7 @@ TOOLS = [
                 "Execute Python code against the dictionary of DataFrames `dfs`. "
                 "Access datasets via `dfs['table_name']`. Available packages: `dfs`, `pd`, `plt`, `sns`. "
                 "Use pd.merge() for multi-table queries. Do NOT call plt.show(). "
-                "Always print key statistics and summary findings."
+                "Always print key statistics and results."
             ),
             "parameters": {
                 "type": "object",
@@ -119,7 +144,7 @@ with st.sidebar:
         st.rerun()
 
 # -------------------------------------------------------------------
-# Session State Initialization & Data Pre-Processing
+# Session State & Dataset Initialization
 # -------------------------------------------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -131,7 +156,6 @@ if uploaded_files:
     for file in uploaded_files:
         table_name = sanitize_table_name(file.name)
 
-        # Handle duplicate file names gracefully
         counter = 1
         original_name = table_name
         while table_name in dfs:
@@ -153,7 +177,6 @@ if uploaded_files:
             f"- Sample Row: {sample_row}\n"
         )
 
-    # Show dataset inspector in the sidebar
     with st.sidebar:
         st.markdown("---")
         st.subheader(f"📊 Datasets Preview ({len(dfs)})")
@@ -169,30 +192,30 @@ if uploaded_files:
 # -------------------------------------------------------------------
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        # If assistant message has execution trace steps, render them in expandable status blocks
+        # Render code execution traces, output text, and charts directly
         if "steps" in msg and msg["steps"]:
             for step_idx, step in enumerate(msg["steps"]):
-                with st.expander(f"🛠️ Execution Step {step_idx + 1}", expanded=False):
-                    st.code(step["code"], language="python")
-                    if step["output"]:
-                        st.text(f"Console Output:\n{step['output']}")
-                    if step["charts"]:
-                        for chart_bytes in step["charts"]:
-                            st.image(chart_bytes, use_container_width=True)
+                st.markdown(f"**Code Execution (Step {step_idx + 1}):**")
+                st.code(step["code"], language="python")
+
+                if step["output"]:
+                    st.markdown("**Output Result:**")
+                    st.text(step["output"])
+
+                if step["charts"]:
+                    for chart_bytes in step["charts"]:
+                        st.image(chart_bytes, use_container_width=True)
 
         # Render final markdown text message
         if msg["content"]:
             st.markdown(msg["content"])
 
 # -------------------------------------------------------------------
-# User Input & Agent Loop
+# User Input & Execution Loop
 # -------------------------------------------------------------------
-user_input = st.chat_input(
-    "Ask a question or request a visualization across your datasets..."
-)
+user_input = st.chat_input("Ask a question about your datasets...")
 
 if user_input:
-    # Validation checks
     if not api_key:
         st.error("Please enter your OpenAI API key in the sidebar.")
         st.stop()
@@ -202,39 +225,37 @@ if user_input:
 
     client = OpenAI(api_key=api_key)
 
-    # 1. Display User Message
+    # Display user message
     st.chat_message("user").markdown(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
 
-    # 2. Build System Prompt with current multi-table schema
+    # Prepare system prompt
     all_schemas_prompt = "\n---\n".join(schema_summaries)
     system_prompt = f"""
-You are an expert AI Data Analyst conversing with a user in a chatbot interface.
-You have direct access to a dictionary of DataFrames named `dfs`.
+You are an expert AI Data Analyst conversing in a chatbot interface.
+You have access to a dictionary of DataFrames named `dfs`.
 
 AVAILABLE DATASETS:
 {all_schemas_prompt}
 
 INSTRUCTIONS:
 1. Access datasets via `dfs['table_name']`.
-2. When answering multi-table questions, use `pd.merge()`, `pd.concat()`, or cross-table filter logic.
-3. Construct charts using `plt`, `sns`, or `df.plot()`. Do NOT call `plt.show()`.
-4. Always print key numerical figures and summarize your findings cleanly in your final message response.
+2. When answering queries, generate Python code to compute metrics or generate plots.
+3. ALWAYS print key output, dataframes, or numbers explicitly.
+4. Synthesize and clearly present the calculated results in your final text response.
 """
 
-    # Build conversation context for API call from session state
     llm_messages = [{"role": "system", "content": system_prompt}]
     for m in st.session_state.messages:
         llm_messages.append({"role": m["role"], "content": m["content"]})
 
-    # 3. Stream Assistant Chat Turn
     with st.chat_message("assistant"):
         assistant_steps = []
         final_response_text = ""
 
         max_steps = 4
         for step in range(max_steps):
-            with st.spinner(f"Analyzing & Coding (Step {step + 1})..."):
+            with st.spinner(f"Analyzing... (Step {step + 1})"):
                 response = client.chat.completions.create(
                     model=model_choice,
                     messages=llm_messages,
@@ -245,44 +266,30 @@ INSTRUCTIONS:
             response_msg = response.choices[0].message
             llm_messages.append(response_msg)
 
-            # Handle Code Action Tool Calls
             if response_msg.tool_calls:
                 for tool_call in response_msg.tool_calls:
                     if tool_call.function.name == "execute_python_code":
                         args = json.loads(tool_call.function.arguments)
                         code_snippet = args.get("code", "")
 
-                        # Render live step execution inside expandable status block
-                        with st.status(
-                            f"Step {step + 1}: Executing Code Action",
-                            expanded=True,
-                        ) as status:
-                            st.code(code_snippet, language="python")
+                        # Render code snippet immediately
+                        st.markdown(f"**Code Execution (Step {step + 1}):**")
+                        st.code(code_snippet, language="python")
 
-                            text_output, charts = (
-                                execute_python_code_and_capture_charts(
-                                    code_snippet, dfs
-                                )
-                            )
+                        # Run code and capture outputs/charts
+                        text_output, charts = execute_python_code_and_capture_charts(
+                            code_snippet, dfs
+                        )
 
-                            if text_output:
-                                st.write("**Console Output:**")
-                                st.text(text_output)
+                        # Display execution output directly in the chat window
+                        if text_output:
+                            st.markdown("**Output Result:**")
+                            st.text(text_output)
 
-                            if charts:
-                                st.write("**Generated Charts:**")
-                                for chart_bytes in charts:
-                                    st.image(
-                                        chart_bytes,
-                                        use_container_width=True,
-                                    )
+                        if charts:
+                            for chart_bytes in charts:
+                                st.image(chart_bytes, use_container_width=True)
 
-                            status.update(
-                                label=f"Step {step + 1}: Complete",
-                                state="complete",
-                            )
-
-                        # Save step data to persist in chat history
                         assistant_steps.append(
                             {
                                 "code": code_snippet,
@@ -291,8 +298,10 @@ INSTRUCTIONS:
                             }
                         )
 
-                        # Feed output back into conversation history
-                        tool_feedback = f"Console Output: {text_output}\nGenerated {len(charts)} chart(s)."
+                        tool_feedback = (
+                            f"Console Output:\n{text_output}\n"
+                            f"Generated {len(charts)} chart(s)."
+                        )
                         llm_messages.append(
                             {
                                 "role": "tool",
@@ -301,12 +310,10 @@ INSTRUCTIONS:
                             }
                         )
             else:
-                # Final text response from Assistant
                 final_response_text = response_msg.content
                 st.markdown(final_response_text)
                 break
 
-        # Save assistant turn to session state
         st.session_state.messages.append(
             {
                 "role": "assistant",
